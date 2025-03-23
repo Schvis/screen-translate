@@ -1,0 +1,10 @@
+Pillow
+requests
+easyocr
+pyautogui
+keyboard
+opencv-python
+numpy
+pygetwindow
+PyQt5
+torch
