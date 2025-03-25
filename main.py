@@ -1,12 +1,11 @@
-import os
-from PIL import Image, ImageFilter, ImageEnhance
+from PIL import Image, ImageDraw
 import requests
 import easyocr
 import pyautogui
 import keyboard 
 import cv2
 import numpy as np
-from PyQt5.QtWidgets import QApplication, QLabel, QMainWindow, QVBoxLayout, QComboBox, QPushButton, QWidget, QColorDialog, QSpinBox
+from PyQt5.QtWidgets import QApplication, QLabel, QMainWindow, QVBoxLayout, QComboBox, QPushButton, QWidget, QColorDialog, QSpinBox, QCheckBox
 from PyQt5.QtGui import QPainter, QColor, QFont
 from PyQt5.QtCore import Qt
 import sys
@@ -15,8 +14,13 @@ import tkinter as tk
 from tkinter import simpledialog, Canvas
 import logging
 import json
+import time
+from skimage.metrics import structural_similarity as compare_ssim
+from difflib import SequenceMatcher
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+reader = None
 
 def get_easyocr_reader(languages):
     try:
@@ -85,11 +89,17 @@ def translate_text(text, source_lang, target_lang):
         "target_lang": target_lang.lower()
     }
     translations = translate_request(data, use_google=not load_api_key())
-    return translations if isinstance(translations, str) else translations[0]["text"] if translations else "Error translating text"
+    translated_text = translations if isinstance(translations, str) else translations[0]["text"] if translations else "Error translating text"
+
+    app_instance = QApplication.instance().activeWindow()
+    if isinstance(app_instance, TranslatorApp):
+        app_instance.log_extracted_text(text)
+
+    return translated_text
 
 def translate_texts(texts, source_lang, target_lang):
     if not load_api_key():
-        return [google_translate_request(text, source_lang.lower(), target_lang.lower()) or "Error translating text" for text in texts]
+        translations = [google_translate_request(text, source_lang.lower(), target_lang.lower()) or "Error translating text" for text in texts]
     else:
         data = {
             "text": texts,
@@ -97,7 +107,14 @@ def translate_texts(texts, source_lang, target_lang):
             "target_lang": target_lang.upper()
         }
         translations = deepl_translate_request(data)
-        return [item["text"] for item in translations] if translations else ["Error translating text"] * len(texts)
+        translations = [item["text"] for item in translations] if translations else ["Error translating text"] * len(texts)
+
+    app_instance = QApplication.instance().activeWindow()
+    if isinstance(app_instance, TranslatorApp):
+        for text in texts:
+            app_instance.log_extracted_text(text)
+
+    return translations
 
 def update_overlay_position(overlay, region):
     try:
@@ -114,7 +131,6 @@ class OverlayWindow(QMainWindow):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setGeometry(*region)
         self.setCursor(Qt.ArrowCursor)
-
         self.screenshot_np = screenshot_np
         self.results = results
         self.translations = translations
@@ -122,70 +138,58 @@ class OverlayWindow(QMainWindow):
         self.is_processing_click = False
         self.text_color = text_color
         self.font_size = font_size
-
-    def mousePressEvent(self, event):
-        if self.is_processing_click:
-            print("Click ignored. Already processing another click.")
-            return
-        self.is_processing_click = True
-        print("Overlay clicked. Ignoring mouse press event.")
-        event.accept()
-        self.is_processing_click = False
-
-    def mouseReleaseEvent(self, event):
-        print("Overlay clicked. Ignoring mouse release event.")
-        event.accept()
-
-    def mouseDoubleClickEvent(self, event):
-        print("Overlay double-clicked. Ignoring double-click event.")
-        event.accept()
+        self.setMouseTracking(True)
 
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        try:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
 
-        for (bbox, translation) in zip(self.results, self.translations):
-            top_left, _, bottom_right, _ = bbox
-            top_left = tuple(map(int, top_left))
-            bottom_right = tuple(map(int, bottom_right))
-            width = bottom_right[0] - top_left[0]
-            height = bottom_right[1] - top_left[1]
+            for (bbox, translation) in zip(self.results, self.translations):
+                top_left, _, bottom_right, _ = bbox
+                top_left = tuple(map(int, top_left))
+                bottom_right = tuple(map(int, bottom_right))
+                width = bottom_right[0] - top_left[0]
+                height = bottom_right[1] - top_left[1]
 
-            is_vertical = height > width
+                is_vertical = height > width
 
-            font_size = self.font_size
-            painter.setFont(QFont("Arial", font_size, QFont.Bold))
-            painter.setPen(self.text_color)
+                font_size = self.font_size
+                painter.setFont(QFont("Arial", font_size, QFont.Bold))
+                painter.setPen(self.text_color)
 
-            text_width = painter.fontMetrics().width(translation)
-            text_height = painter.fontMetrics().height()
+                text_width = painter.fontMetrics().width(translation)
+                text_height = painter.fontMetrics().height()
 
-            if is_vertical:
-                rect_width = font_size
-                rect_height = max(height, text_height * len(translation))
-            else:
-                rect_width = max(width, text_width + 10)
-                rect_height = font_size + 10
+                if is_vertical:
+                    rect_width = font_size
+                    rect_height = max(height, text_height * len(translation))
+                else:
+                    rect_width = max(width, text_width + 10)
+                    rect_height = font_size + 10
 
-            rect_x = top_left[0]
-            rect_y = top_left[1]
+                rect_x = top_left[0]
+                rect_y = top_left[1]
 
-            background_color = QColor(0, 0, 0, 150)
-            painter.setBrush(background_color)
-            painter.setPen(Qt.NoPen)
-            painter.drawRect(rect_x, rect_y, rect_width, rect_height)
+                background_color = QColor(0, 0, 0, 150)
+                painter.setBrush(background_color)
+                painter.setPen(Qt.NoPen)
+                painter.drawRect(rect_x, rect_y, rect_width, rect_height)
 
-            painter.setPen(self.text_color)
-            if is_vertical:
-                x = rect_x + rect_width // 2 - font_size // 2
-                y = rect_y
-                for char in translation:
-                    painter.drawText(x, y, char)
-                    y += font_size
-            else:
-                text_x = rect_x + (rect_width - text_width) // 2
-                text_y = rect_y + rect_height - 5
-                painter.drawText(text_x, text_y, translation)
+                painter.setPen(self.text_color)
+                if is_vertical:
+                    x = rect_x + rect_width // 2 - font_size // 2
+                    y = rect_y
+                    for char in translation:
+                        painter.drawText(x, y, char)
+                        y += font_size
+                else:
+                    text_x = rect_x + (rect_width - text_width) // 2
+                    text_y = rect_y + rect_height - 5
+                    painter.drawText(text_x, text_y, translation)
+        except Exception as e:
+            logging.error(f"Error during paint event: {e}")
+            event.ignore()
 
 def select_screen_region_with_mouse():
     print("Please select a part of the screen using the mouse.")
@@ -234,7 +238,24 @@ def capture_screen_region(region):
         print(f"Error capturing screen region: {e}")
         return None
 
-def capture_screen_with_text_detection_and_overlay(on_key_callback, region, source_lang, target_lang, text_color, font_size):
+def save_detected_text_image(screenshot_np, results, filename="detected_text.png"):
+    try:
+        image = Image.fromarray(screenshot_np)
+        draw = ImageDraw.Draw(image)
+
+        for bbox, text, _ in results:
+            top_left, _, bottom_right, _ = bbox
+            top_left = tuple(map(int, top_left))
+            bottom_right = tuple(map(int, bottom_right))
+            draw.rectangle([top_left, bottom_right], outline="red", width=2)
+            draw.text(top_left, text, fill="red")
+
+        image.save(filename)
+        print(f"Detected text image saved as {filename}")
+    except Exception as e:
+        print(f"Error saving detected text image: {e}")
+
+def capture_screen_with_text_detection_and_overlay(on_key_callback, region, source_lang, target_lang, text_color, font_size, ocr_params=None):
     try:
         print("Capturing selected screen region...")
         screenshot_np = capture_screen_region(region)
@@ -243,18 +264,57 @@ def capture_screen_with_text_detection_and_overlay(on_key_callback, region, sour
             return None
 
         print("Detecting text regions...")
-        results = reader.readtext(screenshot_np)
+        if ocr_params is None:
+            ocr_params = {
+                "detail": 1,
+                "paragraph": False,
+                "contrast_ths": 0.0,
+                "adjust_contrast": 0.0
+            }
+        results = reader.readtext(screenshot_np, **ocr_params)
+        save_detected_text_image(screenshot_np, results)
+
+        print("Grouping text regions into phrases...")
+        grouped_results = []
+        results.sort(key=lambda x: (x[0][0][1], x[0][0][0]))
+        current_phrase = []
+        current_y = None
+        last_x = None
+
+        for result in results:
+            if len(result) == 3:
+                bbox, text, _ = result
+            elif len(result) == 2:
+                bbox, text = result
+            else:
+                logging.error(f"Unexpected result format: {result}")
+                continue
+
+            top_left, _, _, _ = bbox
+            x, y = top_left
+
+            if current_y is None or (last_x is None):
+                current_phrase.append(text)
+                current_y = y
+                last_x = x
+            else:
+                grouped_results.append(" ".join(current_phrase))
+                current_phrase = [text]
+                current_y = y
+                last_x = x
+
+        if current_phrase:
+            grouped_results.append(" ".join(current_phrase))
 
         print("Text detected. Proceeding with batch translation...")
-        texts_to_translate = [text for (_, text, _) in results]
-        translations = translate_texts(texts_to_translate, source_lang, target_lang)
+        translations = translate_texts(grouped_results, source_lang, target_lang)
 
         print("Displaying overlay...")
         app = QApplication.instance()
-        if app is None:
+        if (app is None):
             app = QApplication(sys.argv)
 
-        overlay = OverlayWindow(screenshot_np, [r[0] for r in results], translations, on_key_callback, region, text_color, font_size)
+        overlay = OverlayWindow(screenshot_np, [r[0] for r in results if len(r) >= 2], translations, on_key_callback, region, text_color, font_size)
         overlay.show()
 
         app.processEvents()
@@ -294,17 +354,27 @@ def ensure_config():
         save_config(config)
     if "keybinds" not in config:
         config["keybinds"] = {"Start Scanning": "H", "Stop Scanning": "Q", "Request Translation": "T"}
+    config["keybinds"].setdefault("Start Monitoring", "M")
     if "font_size" not in config:
         config["font_size"] = 16
     if "text_color" not in config:
         config["text_color"] = "#FFFFFF"
     save_config(config)
 
+def save_selected_region(region):
+    config = load_config()
+    config["last_selected_region"] = region
+    save_config(config)
+
+def load_selected_region():
+    config = load_config()
+    return config.get("last_selected_region", None)
+
 class TranslatorApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Translator App")
-        self.setGeometry(100, 100, 400, 300)
+        self.setGeometry(100, 100, 400, 450)
 
         self.config = load_config()
 
@@ -314,20 +384,7 @@ class TranslatorApp(QMainWindow):
         languages = {
             "Japanese": "ja",
             "English": "en",
-            "Russian": "ru",
-            "Indonesian": "id",
-            "Spanish": "es",
-            "French": "fr",
-            "German": "de",
-            "Chinese (Simplified)": "zh-cn",
-            "Chinese (Traditional)": "zh-tw",
-            "Korean": "ko",
-            "Italian": "it",
-            "Portuguese": "pt",
-            "Arabic": "ar",
-            "Hindi": "hi",
-            "Thai": "th",
-            "Vietnamese": "vi"
+            "Russian": "ru"
         }
 
         self.source_lang_combo.addItems(languages.keys())
@@ -342,7 +399,7 @@ class TranslatorApp(QMainWindow):
 
         self.select_area_button = QPushButton("Select Area", self)
 
-        self.keybinds = self.config.get("keybinds", {"Start Scanning": "H", "Stop Scanning": "Q", "Request Translation": "T"})
+        self.keybinds = self.config.get("keybinds", {"Start Scanning": "H", "Stop Scanning": "Q", "Request Translation": "T", "Start Monitoring": "M"})
         self.keybind_labels = {}
 
         layout = QVBoxLayout()
@@ -365,9 +422,16 @@ class TranslatorApp(QMainWindow):
 
             layout.addLayout(keybind_layout)
 
+        self.monitoring_keybind_label = QLabel(f"Current Monitoring Keybind: {self.keybinds['Start Monitoring']}", self)
+        layout.addWidget(self.monitoring_keybind_label)
+
+        self.change_monitoring_keybind_button = QPushButton("Change Monitoring Keybind", self)
+        self.change_monitoring_keybind_button.clicked.connect(lambda: self.change_keybind("Start Monitoring"))
+        layout.addWidget(self.change_monitoring_keybind_button)
+
         self.text_color_button = QPushButton("Select Text Color", self)
         self.text_color_button.clicked.connect(self.select_text_color)
-        self.text_color = QColor(self.config.get("text_color", "#FFFFFF"))  # Default text color (white)
+        self.text_color = QColor(self.config.get("text_color", "#FFFFFF"))
 
         layout.addWidget(self.text_color_button)
 
@@ -378,20 +442,38 @@ class TranslatorApp(QMainWindow):
 
         layout.addWidget(self.font_size_spinbox)
 
+        self.contrast_ths_spinbox = QSpinBox(self)
+        self.contrast_ths_spinbox.setRange(0, 100)
+        self.contrast_ths_spinbox.setValue(70)
+        self.contrast_ths_spinbox.setPrefix("Contrast Threshold (%): ")
+
+        self.paragraph_checkbox = QCheckBox("Enable Paragraph Detection", self)
+
+        layout.addWidget(self.contrast_ths_spinbox)
+        layout.addWidget(self.paragraph_checkbox)
+
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
 
         self.select_area_button.clicked.connect(self.select_area)
 
-        self.selected_region = None
+        self.selected_region = load_selected_region()
+        if self.selected_region:
+            print(f"Loaded last selected region: {self.selected_region}")
+
         self.overlay = None
         self.scanning = False
+        self.monitoring = False
+        self.monitoring_thread = None
+        self.translation_in_progress = False
+        self.current_ocr_languages = None
 
     def select_area(self):
         self.selected_region = select_screen_region_with_mouse()
         if self.selected_region:
             print(f"Selected region: {self.selected_region}")
+            save_selected_region(self.selected_region)
 
     def change_keybind(self, action):
         root = tk.Tk()
@@ -403,6 +485,10 @@ class TranslatorApp(QMainWindow):
             self.keybind_labels[action].setText(f"{action}: {new_key.upper()}")
             print(f"Keybind for '{action}' changed to '{new_key.upper()}'")
             self.save_settings()
+
+            # Update the monitoring keybind label if the action is "Start Monitoring"
+            if action == "Start Monitoring":
+                self.monitoring_keybind_label.setText(f"Current Monitoring Keybind: {new_key.upper()}")
         else:
             print("No key entered. Keybind not changed.")
 
@@ -427,25 +513,35 @@ class TranslatorApp(QMainWindow):
         if not self.selected_region:
             print("No region selected. Please select an area first.")
             return
+
         source_lang = self.language_mapping[self.source_lang_combo.currentText()]
         target_lang = self.language_mapping[self.target_lang_combo.currentText()]
 
         try:
-            logging.info("Initializing EasyOCR reader...")
+            # Ensure the OCR reader is initialized
             global reader
-            reader = get_easyocr_reader([source_lang, target_lang])
+            if reader is None:
+                logging.info("Initializing EasyOCR reader...")
+                reader = get_easyocr_reader([source_lang, target_lang])
         except ValueError:
             print(f"Error: The selected languages ({source_lang}, {target_lang}) are not compatible for OCR.")
             return
 
         font_size = self.font_size_spinbox.value()
+        contrast_ths = self.contrast_ths_spinbox.value() / 100
+        paragraph = self.paragraph_checkbox.isChecked()
 
-        logging.info("Starting translation process...")
-        self.overlay = capture_screen_with_text_detection_and_overlay(
-            self.request_new_translation, self.selected_region, source_lang, target_lang, self.text_color, font_size
-        )
-        if self.overlay:
-            self.overlay.show()
+        ocr_params = {"contrast_ths": contrast_ths, "paragraph": paragraph}
+
+        try:
+            logging.info("Starting translation process...")
+            self.overlay = capture_screen_with_text_detection_and_overlay(
+                self.request_new_translation, self.selected_region, source_lang, target_lang, self.text_color, font_size, ocr_params
+            )
+            if self.overlay:
+                self.overlay.show()
+        except Exception as e:
+            logging.error(f"Error during translation process: {e}")
 
     def request_new_translation(self):
         logging.info("Requesting new translation...")
@@ -453,57 +549,179 @@ class TranslatorApp(QMainWindow):
             self.overlay.close()
         self.start_translation()
 
+    def log_extracted_text(self, text):
+        """Append the extracted text to a log file."""
+        try:
+            with open("extracted_text_log.txt", "a", encoding="utf-8") as log_file:
+                log_file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {text}\n")
+        except Exception as e:
+            logging.error(f"Error logging extracted text: {e}")
+
+    def monitor_changes(self):
+        if not self.selected_region:
+            print("No region selected. Please select an area first.")
+            return
+
+        self.monitoring = True
+        previous_capture = None
+        previous_text = None
+
+        while self.monitoring:
+            try:
+                current_capture = capture_screen_region(self.selected_region)
+                if current_capture is None:
+                    print("Failed to capture screen region. Exiting monitoring.")
+                    break
+
+                if self.overlay:
+                    overlay_region = self.overlay.geometry()
+                    x, y, width, height = overlay_region.x(), overlay_region.y(), overlay_region.width(), overlay_region.height()
+                    current_capture[y:y + height, x:x + width] = 0
+
+                source_lang = self.language_mapping[self.source_lang_combo.currentText()]
+                target_lang = self.language_mapping[self.target_lang_combo.currentText()]
+
+                global reader
+                if self.current_ocr_languages != [source_lang, target_lang]:
+                    logging.info(f"Reinitializing EasyOCR reader with languages: {source_lang}, {target_lang}")
+                    reader = get_easyocr_reader([source_lang])
+                    self.current_ocr_languages = [source_lang, target_lang]
+
+                gray_curr = cv2.cvtColor(current_capture, cv2.COLOR_BGR2GRAY)
+                ocr_params = {
+                    "detail": 1,
+                    "paragraph": True,
+                    "contrast_ths": 0.5,
+                    "adjust_contrast": 0.7
+                }
+                current_results = reader.readtext(gray_curr, **ocr_params)
+
+                current_text = " ".join([result[1] for result in current_results]).strip()
+
+                self.log_extracted_text(current_text)
+
+                source_lang = self.language_mapping[self.source_lang_combo.currentText()]
+
+                if previous_capture is not None:
+                    gray_prev = cv2.cvtColor(previous_capture, cv2.COLOR_BGR2GRAY)
+                    score, _ = compare_ssim(gray_prev, gray_curr, full=True)
+
+                    text_similarity = SequenceMatcher(None, previous_text, current_text).ratio()
+
+                    if text_similarity > 0.65:
+                        print("Text similarity high. Ignoring background changes.")
+                    elif score < 0.95 and not self.translation_in_progress:
+                        print("Significant change detected in the selected region. Starting translation...")
+                        self.translation_in_progress = True
+
+                        if self.overlay:
+                            logging.info("Closing old overlay before starting new translation.")
+                            self.overlay.close()
+                            self.overlay = None
+
+                        self.start_translation()
+                        self.translation_in_progress = False
+                    else:
+                        print("Minor changes detected. Ignoring...")
+
+                previous_capture = current_capture
+                previous_text = current_text
+
+                if not self.monitoring:
+                    print("Monitoring stopped.")
+                    break
+
+                time.sleep(0.5)
+            except Exception as e:
+                logging.error(f"Error during monitoring: {e}")
+                self.translation_in_progress = False
+
+    def start_monitoring(self):
+        if not self.selected_region:
+            print("No region selected. Please select an area first.")
+            return
+
+        print("Starting real-time monitoring...")
+        self.monitoring = True
+        self.monitoring_thread = threading.Thread(target=self.monitor_changes, daemon=True)
+        self.monitoring_thread.start()
+
+    def stop_monitoring(self):
+        if self.monitoring:
+            print("Stopping monitoring...")
+            self.monitoring = False
+            if self.monitoring_thread.is_alive():
+                self.monitoring_thread.join()
+
     def handle_keybinds(self):
         try:
             logging.info("Handling keybinds...")
+            key_states = {
+                "Start Scanning": False,
+                "Stop Scanning": False,
+                "Request Translation": False,
+                "Start Monitoring": False
+            }
+
             while True:
-                if keyboard.is_pressed(self.keybinds["Start Scanning"]) and not self.scanning:
-                    logging.info("Start Scanning key pressed.")
-                    self.scanning = True
-                    self.start_translation()
+                if keyboard.is_pressed(self.keybinds["Start Scanning"]):
+                    if not key_states["Start Scanning"]:
+                        logging.info("Start Scanning key pressed.")
+                        self.scanning = True
+                        self.start_translation()
+                        key_states["Start Scanning"] = True
+                else:
+                    key_states["Start Scanning"] = False
 
                 if keyboard.is_pressed(self.keybinds["Stop Scanning"]):
-                    logging.info("Stop Scanning key pressed.")
-                    self.scanning = False
-                    if self.overlay:
-                        logging.info("Closing overlay.")
-                        self.overlay.close()
-                        self.overlay = None
+                    if not key_states["Stop Scanning"]:
+                        logging.info("Stop Scanning key pressed.")
+                        self.scanning = False
+                        self.stop_monitoring()
+                        if self.overlay:
+                            logging.info("Closing overlay.")
+                            self.overlay.close()
+                            self.overlay = None
+                        key_states["Stop Scanning"] = True
+                else:
+                    key_states["Stop Scanning"] = False
 
-                if keyboard.is_pressed(self.keybinds["Request Translation"]) and self.overlay:
-                    logging.info("Requesting new translation...")
-                    self.request_new_translation()
+                if keyboard.is_pressed(self.keybinds["Request Translation"]):
+                    if not key_states["Request Translation"] and self.overlay:
+                        logging.info("Requesting new translation...")
+                        self.request_new_translation()
+                        key_states["Request Translation"] = True
+                else:
+                    key_states["Request Translation"] = False
+
+                if keyboard.is_pressed(self.keybinds.get("Start Monitoring", "M")):
+                    if not key_states["Start Monitoring"]:
+                        logging.info("Start Monitoring key pressed.")
+                        self.start_monitoring()
+                        key_states["Start Monitoring"] = True
+                else:
+                    key_states["Start Monitoring"] = False
+
+                time.sleep(0.1)
         except Exception as e:
             print(f"Error in keybind handling: {e}")
-
-    def open_keybind_dialog(self):
-        root = tk.Tk()
-        root.withdraw()
-
-        action = simpledialog.askstring("Change Keybind", "Enter action name (e.g., 'Start Scanning'):", parent=root)
-        if action and action in self.keybinds:
-            new_key = simpledialog.askstring("Change Keybind", f"Enter new key for '{action}':", parent=root)
-            if new_key:
-                self.keybinds[action] = new_key.upper()
-                self.keybind_labels[action].setText(f"{action}: {new_key.upper()}")
-                print(f"Keybind for '{action}' changed to '{new_key.upper()}'")
-                self.save_settings()
-            else:
-                print("No key entered. Keybind not changed.")
-        else:
-            print("Invalid action name or canceled.")
-
-        root.destroy()
 
     def closeEvent(self, event):
         print("Closing application...")
         self.scanning = False
+        self.stop_monitoring()
         if self.overlay:
             self.overlay.close()
             self.overlay = None
         self.save_settings()
         QApplication.quit()
         event.accept()
+
+    def reset_ocr(self):
+        """Reset the OCR reader to reinitialize it."""
+        global reader
+        reader = None
+        print("OCR reader has been reset. It will reinitialize on the next use.")
 
 if __name__ == "__main__":
     ensure_config()
